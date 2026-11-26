@@ -12,7 +12,6 @@ import { CitizenReportForm } from './components/CitizenReportForm';
 import { CitizenMapAndList } from './components/CitizenMapAndList';
 import { AdminLogin } from './components/AdminLogin';
 import { AdminDashboard } from './components/AdminDashboard';
-import { SvelteKitBlueprint } from './components/SvelteKitBlueprint';
 import { citizenIdentifier } from './utils/citizenIdentity';
 import { 
   AlertTriangle, 
@@ -317,9 +316,6 @@ export default function App() {
           </div>
         )}
 
-        {activeView === 'blueprint' && (
-          <SvelteKitBlueprint />
-        )}
       </main>
 
       {/* Citizen Identification Modal */}
