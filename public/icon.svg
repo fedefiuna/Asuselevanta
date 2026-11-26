@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#b91c1c" />
+      <stop offset="50%" stop-color="#dc2626" />
+      <stop offset="100%" stop-color="#991b1b" />
+    </linearGradient>
+    <linearGradient id="roadGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#334155" />
+      <stop offset="100%" stop-color="#0f172a" />
+    </linearGradient>
+  </defs>
+  <!-- Background Rounded Rect -->
+  <rect width="512" height="512" rx="128" fill="url(#grad)" />
+  
+  <!-- Outer Glow Ring -->
+  <circle cx="256" cy="256" r="210" fill="none" stroke="rgba(255,255,255,0.2)" stroke-width="8" stroke-dasharray="12 12" />
+
+  <!-- Road Base (perspective road) -->
+  <path d="M190 390 L220 180 L292 180 L322 390 Z" fill="url(#roadGrad)" />
+  
+  <!-- Road Dashes -->
+  <line x1="256" y1="200" x2="256" y2="240" stroke="#f59e0b" stroke-width="8" stroke-linecap="round" />
+  <line x1="256" y1="270" x2="256" y2="320" stroke="#f59e0b" stroke-width="10" stroke-linecap="round" />
+  <line x1="256" y1="350" x2="256" y2="390" stroke="#f59e0b" stroke-width="12" stroke-linecap="round" />
+
+  <!-- Rising Sun behind -->
+  <circle cx="256" cy="165" r="46" fill="#fbbf24" opacity="0.95" />
+  <path d="M256 100 L256 115 M302 119 L292 130 M321 165 L306 165 M302 211 L292 200 M210 119 L220 130 M191 165 L206 165 M210 211 L220 200" stroke="#fef08a" stroke-width="6" stroke-linecap="round" />
+
+  <!-- Pin / Alert Repair Beacon -->
+  <g transform="translate(0, -10)">
+    <!-- Location Pin Badge -->
+    <path d="M256 220 C226 220 202 244 202 274 C202 316 256 366 256 366 C256 366 310 316 310 274 C310 244 286 220 256 220 Z" fill="#ffffff" filter="drop-shadow(0 6px 12px rgba(0,0,0,0.3))" />
+    <circle cx="256" cy="272" r="24" fill="#b91c1c" />
+    <path d="M256 260 L256 276 M256 282 L256 285" stroke="#ffffff" stroke-width="4.5" stroke-linecap="round" />
+  </g>
+
+  <!-- Star of Asuncion (detail at bottom) -->
+  <path d="M256 425 L262 440 L278 440 L265 450 L270 465 L256 455 L242 465 L247 450 L234 440 L250 440 Z" fill="#ffffff" />
+</svg>

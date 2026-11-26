@@ -1,0 +1,10 @@
+{
+  "name": "Remix Asunción Se Levanta",
+  "description": "Plataforma ciudadana y de analítica para el reporte y gestión de irregularidades viales (baches, badenes, alcantarillas y basura) en Asunción.",
+  "requestFramePermissions": [
+    "geolocation"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
