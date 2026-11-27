@@ -18,7 +18,6 @@ import {
   AlertTriangle, 
   Navigation, 
   UploadCloud, 
-  Sparkles,
   ArrowRight,
   ArrowLeft,
   Check,
@@ -63,12 +62,6 @@ const CATEGORIES: { label: IncidentCategory; desc: string; icon: string; alertCo
   }
 ];
 
-const SAMPLE_PHOTOS = [
-  { label: 'Bache Asfalto', url: 'https://images.unsplash.com/photo-1515162816999-a0c47dc192f7?auto=format&fit=crop&w=600&q=80' },
-  { label: 'Alcantarilla Abierta', url: 'https://images.unsplash.com/photo-1542051841857-5f90071e7989?auto=format&fit=crop&w=600&q=80' },
-  { label: 'Basura / Escombros', url: 'https://images.unsplash.com/photo-1530587191325-3db32d826c18?auto=format&fit=crop&w=600&q=80' },
-  { label: 'Badén Roto', url: 'https://images.unsplash.com/photo-1590486803833-1c5dc8ddd4c8?auto=format&fit=crop&w=600&q=80' }
-];
 
 export const CitizenReportForm: React.FC<Props> = ({ onReportCreated, onOpenIdentityModal }) => {
   const [citizen, setCitizen] = useState(userStore.getCitizen());
@@ -86,8 +79,8 @@ export const CitizenReportForm: React.FC<Props> = ({ onReportCreated, onOpenIden
   const [category, setCategory] = useState<IncidentCategory>('Bache');
   const [severity, setSeverity] = useState<IncidentSeverity>('Alta');
   const [description, setDescription] = useState('');
-  const [photoUrl, setPhotoUrl] = useState<string>(SAMPLE_PHOTOS[0].url);
-  const [photoFileName, setPhotoFileName] = useState<string>('foto_muestra_bache.jpg');
+  const [photoUrl, setPhotoUrl] = useState<string>('');
+  const [photoFileName, setPhotoFileName] = useState<string>('');
 
   // Location and Mandatory Barrio state (centered in Asunción)
   const [lat, setLat] = useState<number>(-25.2974);
@@ -575,30 +568,7 @@ export const CitizenReportForm: React.FC<Props> = ({ onReportCreated, onOpenIden
                   </label>
                 )}
 
-                {/* Quick Samples */}
-                <div className="flex items-center gap-2 overflow-x-auto pb-1 pt-1">
-                  <span className="text-[11px] font-bold text-zinc-500 dark:text-zinc-400 whitespace-nowrap flex items-center gap-1">
-                    <Sparkles className="w-3 h-3 text-emerald-500" />
-                    Muestras rápidas:
-                  </span>
-                  {SAMPLE_PHOTOS.map((sp) => (
-                    <button
-                      type="button"
-                      key={sp.label}
-                      onClick={() => {
-                        setPhotoUrl(sp.url);
-                        setPhotoFileName(sp.label + '.jpg');
-                      }}
-                      className={`text-xs px-2.5 py-1 rounded-xl border whitespace-nowrap transition ${
-                        photoUrl === sp.url
-                          ? 'bg-emerald-600 text-white border-emerald-600 font-bold shadow-xs'
-                          : 'bg-white dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 border-zinc-200 dark:border-zinc-700 hover:border-zinc-300'
-                      }`}
-                    >
-                      {sp.label}
-                    </button>
-                  ))}
-                </div>
+                
               </div>
             </div>
 

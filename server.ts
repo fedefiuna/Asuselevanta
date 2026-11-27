@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
 import path from 'node:path';
-import type { Request, Response } from 'express';
+import type { NextFunction, Request, Response } from 'express';
 import { createAsuncionDb } from './server/db.ts';
 import crypto from 'node:crypto';
 import type { IncidentCategory, IncidentStatus } from './src/types.ts';
@@ -10,9 +10,7 @@ import { validateReportInput } from './server/validation.ts';
 import { createRateLimiter } from './server/rateLimit.ts';
 
 const PORT = Number(process.env.PORT) || 3000;
-const DB_PATH = process.env.SQLITE_DB_PATH || path.resolve(process.cwd(), 'data', 'asuncion.sqlite');
-
-const db = createAsuncionDb(DB_PATH);
+const DATABASE_URL = process.env.DATABASE_URL;
 
 // Secreto para la clave opaca de ciudadano. Si no se define, se genera uno por arranque
 // (el ranking sigue funcionando porque la clave solo se compara dentro de cada respuesta).
@@ -80,17 +78,40 @@ function clearSessionCookie(res: Response, name: string) {
   res.append('Set-Cookie', `${name}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
 }
 
+// Express 4 no captura los errores de funciones async: este envoltorio los manda al manejador de errores.
+const ah =
+  (fn: (req: Request, res: Response, next: NextFunction) => Promise<unknown>) =>
+  (req: Request, res: Response, next: NextFunction) => {
+    fn(req, res, next).catch(next);
+  };
+
 async function startServer() {
+  if (!DATABASE_URL) {
+    console.error('Falta DATABASE_URL en el .env (cadena de conexión de Supabase / Postgres).');
+    process.exit(1);
+  }
+
+  const db = await createAsuncionDb(DATABASE_URL, {
+    seedAdmin: {
+      ci: process.env.ADMIN_CI,
+      password: process.env.ADMIN_PASSWORD,
+      fullName: process.env.ADMIN_NAME,
+      email: process.env.ADMIN_EMAIL,
+      employeeNumber: process.env.ADMIN_EMPLOYEE_NUMBER
+    }
+  });
+
   const app = express();
   app.set('trust proxy', 1); // detrás de un proxy (Cloud Run, Render, etc.) req.ip es la IP real
   app.use(express.json({ limit: '3mb' })); // las fotos se comprimen en el navegador antes de enviarse
 
-  app.get('/api/health', (_req, res) => {
-    res.json({ ok: true, engine: 'sqlite', dbPath: db.dbPath });
-  });
+  app.get('/api/health', ah(async (_req, res) => {
+    await db.ping();
+    res.json({ ok: true, engine: 'postgres' });
+  }));
 
   // --- REPORTS ROUTES ---
-  app.get('/api/reports', (req, res) => {
+  app.get('/api/reports', ah(async (req, res) => {
     const date = typeof req.query.date === 'string' ? req.query.date : undefined;
     const month = typeof req.query.month === 'string' ? req.query.month : undefined;
     const status = typeof req.query.status === 'string' ? (req.query.status as IncidentStatus | 'Todos') : undefined;
@@ -99,15 +120,15 @@ async function startServer() {
     const q = typeof req.query.q === 'string' ? req.query.q : undefined;
 
     // Administradores (nivel 1 y 2) ven datos completos; el público ve primer nombre y cédula enmascarada.
-    const isAdmin = Boolean(db.getAdminBySession(getAdminToken(req)));
-    const reports = db
-      .listReports({ date, month, status, category, barrio, q, searchCitizen: isAdmin })
-      .map((r) => serializeReport(r, isAdmin, CITIZEN_KEY_SECRET));
+    const isAdmin = Boolean(await db.getAdminBySession(getAdminToken(req)));
+    const reports = (await db.listReports({ date, month, status, category, barrio, q, searchCitizen: isAdmin })).map(
+      (r) => serializeReport(r, isAdmin, CITIZEN_KEY_SECRET)
+    );
     res.setHeader('Cache-Control', 'no-store'); // la respuesta depende del rol: que nada la guarde
     res.json({ reports });
-  });
+  }));
 
-  app.post('/api/reports', (req, res) => {
+  app.post('/api/reports', ah(async (req, res) => {
     const validation = validateReportInput(req.body, { allowSamplePhotos: ALLOW_SAMPLE_PHOTOS });
     if (!validation.ok) {
       res.status(400).json({ error: validation.error });
@@ -116,7 +137,7 @@ async function startServer() {
     const input = validation.data;
 
     // Si hay sesión de ciudadano, su identidad manda sobre lo que venga en el cuerpo.
-    const sessionCitizen = db.getCitizenBySession(getCitizenToken(req));
+    const sessionCitizen = await db.getCitizenBySession(getCitizenToken(req));
     if (sessionCitizen) {
       input.citizenId = sessionCitizen.id;
       input.citizenName = sessionCitizen.fullName;
@@ -131,7 +152,7 @@ async function startServer() {
     }
 
     try {
-      const created = db.createReport({
+      const created = await db.createReport({
         ...input,
         description: input.description || `Reporte ciudadano de ${input.category.toLowerCase()} en ${input.location.barrio}.`,
         location: {
@@ -139,16 +160,16 @@ async function startServer() {
           address: input.location.address || `Intersección vial en ${input.location.barrio}`
         }
       });
-      const isAdmin = Boolean(db.getAdminBySession(getAdminToken(req)));
+      const isAdmin = Boolean(await db.getAdminBySession(getAdminToken(req)));
       res.status(201).json({ report: serializeReport(created, isAdmin, CITIZEN_KEY_SECRET) });
     } catch (err) {
-      console.error('Error creating report in SQLite:', err);
-      res.status(500).json({ error: 'No se pudo guardar el reporte en SQLite.' });
+      console.error('Error creating report in Postgres:', err);
+      res.status(500).json({ error: 'No se pudo guardar el reporte en la base de datos.' });
     }
-  });
+  }));
 
-  app.patch('/api/reports/:id/status', (req, res) => {
-    const admin = db.getAdminBySession(getAdminToken(req));
+  app.patch('/api/reports/:id/status', ah(async (req, res) => {
+    const admin = await db.getAdminBySession(getAdminToken(req));
     if (!admin || admin.level !== 2) {
       res.status(403).json({ error: 'Solo perfiles administrativos de Nivel 2 pueden modificar reportes.' });
       return;
@@ -161,7 +182,7 @@ async function startServer() {
       return;
     }
 
-    const updated = db.updateReportStatus(
+    const updated = await db.updateReportStatus(
       id,
       status as IncidentStatus,
       typeof notes === 'string' ? notes : undefined,
@@ -173,10 +194,10 @@ async function startServer() {
       return;
     }
     res.json({ report: serializeReport(updated, true, CITIZEN_KEY_SECRET) });
-  });
+  }));
 
-  app.post('/api/reports/bulk-status', (req, res) => {
-    const admin = db.getAdminBySession(getAdminToken(req));
+  app.post('/api/reports/bulk-status', ah(async (req, res) => {
+    const admin = await db.getAdminBySession(getAdminToken(req));
     if (!admin || admin.level !== 2) {
       res.status(403).json({ error: 'Solo perfiles administrativos de Nivel 2 pueden solucionar en lote.' });
       return;
@@ -188,39 +209,39 @@ async function startServer() {
       return;
     }
 
-    const updatedCount = db.bulkUpdateReportsStatus(
+    const updatedCount = await db.bulkUpdateReportsStatus(
       ids,
       status as IncidentStatus,
       typeof notes === 'string' ? notes : undefined,
       admin.fullName
     );
-    const reports = db.listReports().map((r) => serializeReport(r, true, CITIZEN_KEY_SECRET));
+    const reports = (await db.listReports()).map((r) => serializeReport(r, true, CITIZEN_KEY_SECRET));
     res.json({ updatedCount, reports });
-  });
+  }));
 
-  app.delete('/api/reports/:id', (req, res) => {
-    const admin = db.getAdminBySession(getAdminToken(req));
+  app.delete('/api/reports/:id', ah(async (req, res) => {
+    const admin = await db.getAdminBySession(getAdminToken(req));
     if (!admin || admin.level !== 2) {
       res.status(403).json({ error: 'Solo perfiles administrativos de Nivel 2 pueden eliminar reportes.' });
       return;
     }
-    const deleted = db.deleteReport(req.params.id);
+    const deleted = await db.deleteReport(req.params.id);
     if (!deleted) {
       res.status(404).json({ error: 'Reporte no encontrado.' });
       return;
     }
     res.json({ success: true });
-  });
+  }));
 
   // --- CITIZEN ROUTES ---
-  app.get('/api/citizens/me', (req, res) => {
-    const citizen = db.getCitizenBySession(getCitizenToken(req));
+  app.get('/api/citizens/me', ah(async (req, res) => {
+    const citizen = await db.getCitizenBySession(getCitizenToken(req));
     res.json({ citizen: withCitizenKey(citizen) });
-  });
+  }));
 
-  app.post('/api/citizens/register', (req, res) => {
+  app.post('/api/citizens/register', ah(async (req, res) => {
     const { cedula, fullName, phone } = req.body || {};
-    const result = db.registerCitizen({
+    const result = await db.registerCitizen({
       cedula: String(cedula || ''),
       fullName: String(fullName || ''),
       phone: typeof phone === 'string' ? phone : undefined
@@ -233,50 +254,50 @@ async function startServer() {
 
     setSessionCookie(res, 'asuncion_citizen_token', result.token);
     res.status(201).json({ citizen: withCitizenKey(result.citizen), token: result.token });
-  });
+  }));
 
-  app.post('/api/citizens/logout', (req, res) => {
-    db.deleteSession(getCitizenToken(req));
+  app.post('/api/citizens/logout', ah(async (req, res) => {
+    await db.deleteSession(getCitizenToken(req));
     clearSessionCookie(res, 'asuncion_citizen_token');
     res.json({ success: true });
-  });
+  }));
 
   // --- ADMIN ROUTES ---
-  app.get('/api/admins/me', (req, res) => {
-    const admin = db.getAdminBySession(getAdminToken(req));
+  app.get('/api/admins/me', ah(async (req, res) => {
+    const admin = await db.getAdminBySession(getAdminToken(req));
     res.json({ admin });
-  });
+  }));
 
-  app.post('/api/admins/login', (req, res) => {
+  app.post('/api/admins/login', ah(async (req, res) => {
     const { identifier, password } = req.body || {};
-    const result = db.loginAdmin(String(identifier || ''), String(password || ''));
+    const result = await db.loginAdmin(String(identifier || ''), String(password || ''));
     if (!result.success || !result.admin || !result.token) {
       res.status(401).json({ error: result.error || 'Credenciales inválidas.' });
       return;
     }
     setSessionCookie(res, 'asuncion_admin_token', result.token);
     res.json({ admin: result.admin, token: result.token });
-  });
+  }));
 
-  app.post('/api/admins/logout', (req, res) => {
-    db.deleteSession(getAdminToken(req));
+  app.post('/api/admins/logout', ah(async (req, res) => {
+    await db.deleteSession(getAdminToken(req));
     clearSessionCookie(res, 'asuncion_admin_token');
     res.json({ success: true });
-  });
+  }));
 
-  app.get('/api/admins', (req, res) => {
-    const admin = db.getAdminBySession(getAdminToken(req));
+  app.get('/api/admins', ah(async (req, res) => {
+    const admin = await db.getAdminBySession(getAdminToken(req));
     if (!admin) {
       res.status(401).json({ error: 'Sesión administrativa requerida.' });
       return;
     }
-    res.json({ accounts: db.listAdminAccounts() });
-  });
+    res.json({ accounts: await db.listAdminAccounts() });
+  }));
 
-  app.post('/api/admins', (req, res) => {
-    const actor = db.getAdminBySession(getAdminToken(req));
+  app.post('/api/admins', ah(async (req, res) => {
+    const actor = await db.getAdminBySession(getAdminToken(req));
     const { ci, employeeNumber, fullName, level, password, email } = req.body || {};
-    const result = db.createAdminAccount(
+    const result = await db.createAdminAccount(
       {
         ci: String(ci || ''),
         employeeNumber: String(employeeNumber || ''),
@@ -293,17 +314,17 @@ async function startServer() {
       return;
     }
     res.status(201).json({ account: result.account });
-  });
+  }));
 
-  app.delete('/api/admins/:id', (req, res) => {
-    const actor = db.getAdminBySession(getAdminToken(req));
-    const result = db.deleteAdminAccount(req.params.id, actor);
+  app.delete('/api/admins/:id', ah(async (req, res) => {
+    const actor = await db.getAdminBySession(getAdminToken(req));
+    const result = await db.deleteAdminAccount(req.params.id, actor);
     if (!result.success) {
       res.status(actor?.level !== 2 ? 403 : 400).json({ error: result.error || 'No se pudo eliminar el perfil.' });
       return;
     }
     res.json({ success: true });
-  });
+  }));
 
   // --- VITE / STATIC FRONTEND ---
   if (process.env.NODE_ENV !== 'production') {
@@ -321,9 +342,19 @@ async function startServer() {
     });
   }
 
+  // Manejador de errores: cualquier fallo inesperado responde 500 en vez de tumbar el servidor.
+  app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    console.error('Error no controlado:', err);
+    if (res.headersSent) return;
+    res.status(500).json({ error: 'Error interno del servidor.' });
+  });
+
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Asunción Se Levanta server listening on http://0.0.0.0:${PORT} (SQLite: ${db.dbPath})`);
+    console.log(`Asunción Se Levanta server listening on http://0.0.0.0:${PORT} (Postgres)`);
   });
 }
 
-startServer();
+startServer().catch((err) => {
+  console.error('No se pudo iniciar el servidor:', err);
+  process.exit(1);
+});

@@ -33,9 +33,9 @@ export default function App() {
   const [isAdminLoggedIn, setIsAdminLoggedIn] = useState<boolean>(!!userStore.getAdmin());
   const [isIdentityModalOpen, setIsIdentityModalOpen] = useState<boolean>(false);
   const [isContributionModalOpen, setIsContributionModalOpen] = useState<boolean>(false);
-  const [activeView, setActiveView] = useState<'report' | 'map' | 'ranking' | 'admin' | 'blueprint'>(() => {
+  const [activeView, setActiveView] = useState<'report' | 'map' | 'ranking' | 'admin' | 'admin'>(() => {
     const hash = typeof window !== 'undefined' ? window.location.hash.replace('#', '') : '';
-    if (hash === 'map' || hash === 'ranking' || hash === 'admin' || hash === 'blueprint' || hash === 'report') {
+    if (hash === 'map' || hash === 'ranking' || hash === 'admin' || hash === 'report') {
       return hash;
     }
     return 'report';

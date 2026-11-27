@@ -9,7 +9,6 @@ import {
   PlusCircle, 
   Map as MapIcon, 
   BarChart3, 
-  Code2, 
   User, 
   Sparkles,
   ShieldCheck,
@@ -18,8 +17,8 @@ import {
 } from 'lucide-react';
 
 interface Props {
-  activeView: 'report' | 'map' | 'ranking' | 'admin' | 'blueprint';
-  setActiveView: (view: 'report' | 'map' | 'ranking' | 'admin' | 'blueprint') => void;
+  activeView: 'report' | 'map' | 'ranking' | 'admin' | 'admin';
+  setActiveView: (view: 'report' | 'map' | 'ranking' | 'admin' | 'admin') => void;
   onOpenIdentityModal: () => void;
   onOpenContributionModal?: () => void;
 }
@@ -128,17 +127,7 @@ export const Header: React.FC<Props> = ({
               <span>Panel Admin {admin && '✓'}</span>
             </button>
 
-            <button
-              onClick={() => setActiveView('blueprint')}
-              className={`flex items-center gap-1.5 px-2.5 lg:px-3 py-1.5 rounded-xl text-xs font-bold transition-all whitespace-nowrap cursor-pointer ${
-                activeView === 'blueprint'
-                  ? 'bg-emerald-600 text-white shadow-sm'
-                  : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-200'
-              }`}
-            >
-              <Code2 className="w-3.5 h-3.5 text-amber-300 shrink-0" />
-              <span>SvelteKit</span>
-            </button>
+
           </nav>
 
           {/* Right Action Area */}
@@ -239,15 +228,6 @@ export const Header: React.FC<Props> = ({
           <span>Admin</span>
         </button>
 
-        <button
-          onClick={() => setActiveView('blueprint')}
-          className={`flex flex-col items-center gap-1 py-1 px-3 rounded-xl text-[10px] font-bold transition ${
-            activeView === 'blueprint' ? 'text-emerald-600 dark:text-emerald-400 font-black' : 'text-zinc-500 dark:text-zinc-400'
-          }`}
-        >
-          <Code2 className="w-5 h-5" />
-          <span>SvelteKit</span>
-        </button>
       </div>
     </>
   );

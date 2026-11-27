@@ -1,7 +1,6 @@
-import fs from 'node:fs';
-import path from 'node:path';
 import crypto from 'node:crypto';
-import { DatabaseSync } from 'node:sqlite';
+import { promisify } from 'node:util';
+import pg from 'pg';
 import type {
   AdminLevel,
   AdminUser,
@@ -18,7 +17,8 @@ import {
   validateAdminRegistration,
   validateCitizenRegistration
 } from '../src/utils/userValidation.ts';
-import { INITIAL_REPORTS } from '../src/data/mockReports.ts';
+
+const { Pool } = pg;
 
 export interface AdminAccountPublic {
   id: string;
@@ -43,21 +43,62 @@ export interface ReportQueryFilters {
   searchCitizen?: boolean;
 }
 
-function hashPassword(password: string): string {
+/** Datos del primer administrador (Nivel 2). Normalmente vienen de ADMIN_CI / ADMIN_PASSWORD en el .env. */
+export interface SeedAdminOptions {
+  ci?: string;
+  password?: string;
+  fullName?: string;
+  email?: string;
+  employeeNumber?: string;
+}
+
+export interface CreateDbOptions {
+  seedAdmin?: SeedAdminOptions;
+  /** Tamaño máximo del pool de conexiones. Por defecto 5. */
+  poolMax?: number;
+  /** Crear las tablas si no existen (idempotente). Por defecto true. */
+  autoMigrate?: boolean;
+  /** Solo para tests: usa un schema aislado (se crea y se puede borrar con close({ dropSchema: true })). */
+  schema?: string;
+}
+
+/** Algo que sabe ejecutar consultas: el pool o un cliente dentro de una transacción. */
+interface Queryable {
+  query<R extends pg.QueryResultRow = any>(text: string, params?: unknown[]): Promise<pg.QueryResult<R>>;
+}
+
+// ---------------------------------------------------------------------------
+// Contraseñas (mismo formato salt:hash que antes, pero sin bloquear el servidor)
+// ---------------------------------------------------------------------------
+const scryptAsync = promisify(crypto.scrypt) as (
+  password: string,
+  salt: string,
+  keylen: number
+) => Promise<Buffer>;
+
+async function hashPassword(password: string): Promise<string> {
   const salt = crypto.randomBytes(16).toString('hex');
-  const derived = crypto.scryptSync(password, salt, 64).toString('hex');
+  const derived = (await scryptAsync(password, salt, 64)).toString('hex');
   return `${salt}:${derived}`;
 }
 
-function verifyPassword(password: string, storedHash: string): boolean {
+async function verifyPassword(password: string, storedHash: string): Promise<boolean> {
   const parts = storedHash.split(':');
   if (parts.length !== 2) return false;
   const [salt, originalHex] = parts;
-  const derived = crypto.scryptSync(password, salt, 64);
+  const derived = await scryptAsync(password, salt, 64);
   const original = Buffer.from(originalHex, 'hex');
   if (derived.length !== original.length) return false;
   return crypto.timingSafeEqual(derived, original);
 }
+
+// ---------------------------------------------------------------------------
+// Filas de la base y conversores
+// ---------------------------------------------------------------------------
+// Postgres devuelve las columnas timestamptz como objetos Date; la app espera strings ISO.
+type Ts = Date | string;
+const iso = (v: Ts): string => (v instanceof Date ? v.toISOString() : v);
+const isoOrUndefined = (v: Ts | null): string | undefined => (v ? iso(v) : undefined);
 
 interface ReportRow {
   id: string;
@@ -74,17 +115,17 @@ interface ReportRow {
   severity: IncidentSeverity;
   status: IncidentStatus;
   resolution_notes: string | null;
-  created_at: string;
+  created_at: Ts;
   report_date: string;
   report_month: string;
-  updated_at: string;
-  resolved_at: string | null;
+  updated_at: Ts;
+  resolved_at: Ts | null;
 }
 
 interface HistoryRow {
   id: string;
   report_id: string;
-  timestamp: string;
+  timestamp: Ts;
   previous_status: IncidentStatus | null;
   new_status: IncidentStatus;
   changed_by: string;
@@ -100,7 +141,7 @@ interface AdminRow {
   level: number;
   role: 'analista' | 'supervisor' | 'administrador';
   password_hash: string;
-  created_at: string;
+  created_at: Ts;
   created_by: string | null;
 }
 
@@ -109,7 +150,7 @@ interface CitizenRow {
   ci: string;
   full_name: string;
   phone: string | null;
-  registered_at: string;
+  registered_at: Ts;
 }
 
 function mapAdminPublic(row: AdminRow): AdminAccountPublic {
@@ -121,8 +162,22 @@ function mapAdminPublic(row: AdminRow): AdminAccountPublic {
     email: row.email || undefined,
     level: row.level === 2 ? 2 : 1,
     role: row.role,
-    createdAt: row.created_at,
+    createdAt: iso(row.created_at),
     createdBy: row.created_by || undefined
+  };
+}
+
+function mapAdminUser(row: AdminRow, token: string): AdminUser {
+  return {
+    id: row.id,
+    ci: row.ci,
+    employeeNumber: row.employee_number,
+    email: row.email || `ci.${row.ci}@asuncion.gov.py`,
+    fullName: row.full_name,
+    level: row.level === 2 ? 2 : 1,
+    role: row.role,
+    token,
+    createdAt: iso(row.created_at)
   };
 }
 
@@ -132,7 +187,7 @@ function mapCitizen(row: CitizenRow): CitizenUser {
     ci: row.ci,
     fullName: row.full_name,
     phone: row.phone || undefined,
-    registeredAt: row.registered_at
+    registeredAt: iso(row.registered_at)
   };
 }
 
@@ -154,256 +209,271 @@ function mapReport(row: ReportRow, history: StatusHistoryEntry[]): IncidentRepor
     severity: row.severity,
     status: row.status,
     resolutionNotes: row.resolution_notes || undefined,
-    createdAt: row.created_at,
+    createdAt: iso(row.created_at),
     reportDate: row.report_date,
     reportMonth: row.report_month,
-    updatedAt: row.updated_at,
-    resolvedAt: row.resolved_at || undefined,
+    updatedAt: iso(row.updated_at),
+    resolvedAt: isoOrUndefined(row.resolved_at),
     statusHistory: history
   };
 }
 
-export function createAsuncionDb(dbPath: string) {
-  if (dbPath !== ':memory:') {
-    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+// ---------------------------------------------------------------------------
+// Esquema (igual a schema.sql, sin el prefijo "public." para poder usar schemas de prueba).
+// Es idempotente: si ya corriste schema.sql en Supabase, no cambia nada.
+// ---------------------------------------------------------------------------
+const SCHEMA_SQL = `
+create table if not exists citizens (
+  id            text primary key,
+  ci            text not null unique,
+  full_name     text not null,
+  phone         text,
+  registered_at timestamptz not null default now()
+);
+
+create table if not exists admins (
+  id              text primary key,
+  ci              text not null unique,
+  employee_number text not null unique,
+  full_name       text not null,
+  email           text unique,
+  level           integer not null check (level in (1, 2)),
+  role            text not null check (role in ('analista', 'supervisor', 'administrador')),
+  password_hash   text not null,
+  created_at      timestamptz not null default now(),
+  created_by      text
+);
+
+create table if not exists sessions (
+  token        text primary key,
+  subject_type text not null check (subject_type in ('citizen', 'admin')),
+  subject_id   text not null,
+  created_at   timestamptz not null default now(),
+  expires_at   timestamptz not null
+);
+
+create table if not exists reports (
+  id               text primary key,
+  category         text not null check (category in ('Bache', 'Badén en mal estado', 'Alcantarilla sin tapa', 'Suciedad / Basura')),
+  description      text not null,
+  photo_url        text not null,
+  lat              double precision not null,
+  lng              double precision not null,
+  address          text not null,
+  barrio           text not null,
+  citizen_id       text references citizens(id) on update cascade on delete set null,
+  citizen_name     text not null,
+  citizen_phone    text,
+  severity         text not null check (severity in ('Baja', 'Media', 'Alta', 'Crítica')),
+  status           text not null check (status in ('Pendiente', 'En revisión', 'Solucionado')),
+  resolution_notes text,
+  created_at       timestamptz not null default now(),
+  report_date      text not null,
+  report_month     text not null,
+  updated_at       timestamptz not null default now(),
+  resolved_at      timestamptz
+);
+
+create table if not exists report_status_history (
+  id              text primary key,
+  report_id       text not null references reports(id) on delete cascade,
+  "timestamp"     timestamptz not null default now(),
+  previous_status text,
+  new_status      text not null check (new_status in ('Pendiente', 'En revisión', 'Solucionado')),
+  changed_by      text not null,
+  notes           text
+);
+
+create table if not exists report_counters (
+  year     text primary key,
+  last_seq integer not null default 0
+);
+
+create index if not exists idx_reports_status      on reports (status);
+create index if not exists idx_reports_category    on reports (category);
+create index if not exists idx_reports_barrio      on reports (barrio);
+create index if not exists idx_reports_date        on reports (report_date);
+create index if not exists idx_reports_month       on reports (report_month);
+create index if not exists idx_reports_created_at  on reports (created_at desc);
+create index if not exists idx_reports_citizen_id  on reports (citizen_id);
+create index if not exists idx_history_report_id   on report_status_history (report_id, "timestamp" asc);
+create index if not exists idx_sessions_expires    on sessions (expires_at);
+
+-- Seguridad: RLS activado y sin políticas (la API pública de Supabase no puede tocar nada).
+alter table citizens              enable row level security;
+alter table admins                enable row level security;
+alter table sessions              enable row level security;
+alter table reports               enable row level security;
+alter table report_status_history enable row level security;
+alter table report_counters       enable row level security;
+`;
+
+function buildPoolConfig(databaseUrl: string, max: number): pg.PoolConfig {
+  let connectionString = databaseUrl;
+  let isLocal = false;
+  try {
+    const url = new URL(databaseUrl);
+    isLocal = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
+    // Si la URL trae ?sslmode=..., pisa la opción ssl de abajo y Supabase puede rechazar el certificado.
+    url.searchParams.delete('sslmode');
+    connectionString = url.toString();
+  } catch {
+    // Si no se puede interpretar, se usa tal cual.
   }
 
-  const db = new DatabaseSync(dbPath);
-  db.exec(`
-    PRAGMA journal_mode = WAL;
-    PRAGMA foreign_keys = ON;
-    PRAGMA busy_timeout = 5000;
-  `);
+  const sslDisabled = isLocal || process.env.DATABASE_SSL === 'false';
+  return {
+    connectionString,
+    max,
+    ssl: sslDisabled ? false : { rejectUnauthorized: false },
+    connectionTimeoutMillis: 10_000,
+    idleTimeoutMillis: 30_000
+  };
+}
 
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS citizens (
-      id TEXT PRIMARY KEY,
-      ci TEXT NOT NULL UNIQUE,
-      full_name TEXT NOT NULL,
-      phone TEXT,
-      registered_at TEXT NOT NULL
-    );
+export async function createAsuncionDb(databaseUrl: string, options: CreateDbOptions = {}) {
+  if (!databaseUrl) {
+    throw new Error('Falta DATABASE_URL (cadena de conexión de Postgres / Supabase).');
+  }
 
-    CREATE TABLE IF NOT EXISTS admins (
-      id TEXT PRIMARY KEY,
-      ci TEXT NOT NULL UNIQUE,
-      employee_number TEXT NOT NULL UNIQUE,
-      full_name TEXT NOT NULL,
-      email TEXT UNIQUE,
-      level INTEGER NOT NULL CHECK (level IN (1, 2)),
-      role TEXT NOT NULL CHECK (role IN ('analista', 'supervisor', 'administrador')),
-      password_hash TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      created_by TEXT
-    );
+  const schema = options.schema;
+  if (schema && !/^[a-z_][a-z0-9_]*$/.test(schema)) {
+    throw new Error('Nombre de schema inválido.');
+  }
 
-    CREATE TABLE IF NOT EXISTS sessions (
-      token TEXT PRIMARY KEY,
-      subject_type TEXT NOT NULL CHECK (subject_type IN ('citizen', 'admin')),
-      subject_id TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      expires_at TEXT NOT NULL
-    );
+  const pool = new Pool(buildPoolConfig(databaseUrl, options.poolMax ?? (Number(process.env.DB_POOL_MAX) || 5)));
+  pool.on('error', (err) => {
+    // Un cliente inactivo perdió la conexión: no debe tumbar el servidor.
+    console.error('Postgres pool error:', err.message);
+  });
 
-    CREATE TABLE IF NOT EXISTS reports (
-      id TEXT PRIMARY KEY,
-      category TEXT NOT NULL CHECK (category IN ('Bache', 'Badén en mal estado', 'Alcantarilla sin tapa', 'Suciedad / Basura')),
-      description TEXT NOT NULL,
-      photo_url TEXT NOT NULL,
-      lat REAL NOT NULL,
-      lng REAL NOT NULL,
-      address TEXT NOT NULL,
-      barrio TEXT NOT NULL,
-      citizen_id TEXT REFERENCES citizens(id) ON UPDATE CASCADE ON DELETE SET NULL,
-      citizen_name TEXT NOT NULL,
-      citizen_phone TEXT,
-      severity TEXT NOT NULL CHECK (severity IN ('Baja', 'Media', 'Alta', 'Crítica')),
-      status TEXT NOT NULL CHECK (status IN ('Pendiente', 'En revisión', 'Solucionado')),
-      resolution_notes TEXT,
-      created_at TEXT NOT NULL,
-      report_date TEXT NOT NULL,
-      report_month TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      resolved_at TEXT
-    );
+  if (schema) {
+    pool.on('connect', (client) => {
+      client.query(`SET search_path TO "${schema}", public`).catch(() => undefined);
+    });
+    await pool.query(`CREATE SCHEMA IF NOT EXISTS "${schema}"`);
+  }
 
-    CREATE TABLE IF NOT EXISTS report_status_history (
-      id TEXT PRIMARY KEY,
-      report_id TEXT NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
-      timestamp TEXT NOT NULL,
-      previous_status TEXT,
-      new_status TEXT NOT NULL CHECK (new_status IN ('Pendiente', 'En revisión', 'Solucionado')),
-      changed_by TEXT NOT NULL,
-      notes TEXT
-    );
+  const exec = pool as unknown as Queryable;
 
-    CREATE INDEX IF NOT EXISTS idx_reports_status ON reports(status);
-    CREATE INDEX IF NOT EXISTS idx_reports_category ON reports(category);
-    CREATE INDEX IF NOT EXISTS idx_reports_barrio ON reports(barrio);
-    CREATE INDEX IF NOT EXISTS idx_reports_date ON reports(report_date);
-    CREATE INDEX IF NOT EXISTS idx_reports_month ON reports(report_month);
-    CREATE INDEX IF NOT EXISTS idx_reports_created_at ON reports(created_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_history_report_id ON report_status_history(report_id, timestamp ASC);
-    CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
-  `);
-
-  function runInTransaction<T>(fn: () => T): T {
-    db.exec('BEGIN IMMEDIATE');
+  async function withTransaction<T>(fn: (tx: Queryable) => Promise<T>): Promise<T> {
+    const client = await pool.connect();
     try {
-      const result = fn();
-      db.exec('COMMIT');
+      await client.query('BEGIN');
+      const result = await fn(client as unknown as Queryable);
+      await client.query('COMMIT');
       return result;
     } catch (err) {
-      db.exec('ROLLBACK');
+      try {
+        await client.query('ROLLBACK');
+      } catch {
+        // la conexión ya estaba rota; se ignora
+      }
       throw err;
+    } finally {
+      client.release();
     }
   }
 
-  // Seed root Nivel 2 admin if missing
-  const rootExists = db.prepare('SELECT id FROM admins WHERE id = ?').get('1000001') as { id: string } | undefined;
-  if (!rootExists) {
-    db.prepare(`
-      INSERT INTO admins (id, ci, employee_number, full_name, email, level, role, password_hash, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      '1000001',
-      '1000001',
-      'EMP-001',
-      'Ing. Mario Arzamendia',
-      'admin@asuncion.gov.py',
-      2,
-      'administrador',
-      hashPassword('admin123'),
-      '2026-01-01T08:00:00.000Z'
+  if (options.autoMigrate !== false) {
+    await pool.query(SCHEMA_SQL);
+  }
+
+  // -------------------------------------------------------------------------
+  // Primer administrador (Nivel 2), desde variables de entorno
+  // -------------------------------------------------------------------------
+  async function seedRootAdmin(seed: SeedAdminOptions | undefined) {
+    const ci = normalizeCI(seed?.ci || '');
+    if (!seed || !ci || !seed.password) {
+      const any = await exec.query('SELECT 1 FROM admins LIMIT 1');
+      if (any.rows.length === 0) {
+        console.warn(
+          'No hay administradores en la base. Define ADMIN_CI y ADMIN_PASSWORD en el .env y reinicia el servidor.'
+        );
+      }
+      return;
+    }
+    if (seed.password.length < 8) {
+      throw new Error('ADMIN_PASSWORD debe tener al menos 8 caracteres.');
+    }
+
+    const existing = await exec.query('SELECT id FROM admins WHERE id = $1', [ci]);
+    if (existing.rows.length > 0) return; // ya existe: no se toca su contraseña
+
+    await exec.query(
+      `INSERT INTO admins (id, ci, employee_number, full_name, email, level, role, password_hash, created_at, created_by)
+       VALUES ($1, $2, $3, $4, $5, 2, 'administrador', $6, $7, NULL)
+       ON CONFLICT DO NOTHING`,
+      [
+        ci,
+        ci,
+        (seed.employeeNumber || 'EMP-001').trim(),
+        (seed.fullName || 'Administrador Municipal').trim(),
+        seed.email?.trim() || null,
+        await hashPassword(seed.password),
+        new Date().toISOString()
+      ]
     );
+    console.log(`Administrador inicial creado (C.I. ${ci}).`);
   }
 
-  // Seed initial municipal reports only if reports table is completely empty
-  const reportCountRow = db.prepare('SELECT COUNT(*) AS count FROM reports').get() as { count: number };
-  if (reportCountRow.count === 0) {
-    runInTransaction(() => {
-      const insertReport = db.prepare(`
-        INSERT INTO reports (
-          id, category, description, photo_url, lat, lng, address, barrio,
-          citizen_id, citizen_name, citizen_phone, severity, status, resolution_notes,
-          created_at, report_date, report_month, updated_at, resolved_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
+  await seedRootAdmin(options.seedAdmin);
 
-      const insertHistory = db.prepare(`
-        INSERT INTO report_status_history (
-          id, report_id, timestamp, previous_status, new_status, changed_by, notes
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-      `);
-
-      // Offset two solved/older seed reports slightly into the prior month so month filtering works out-of-the-box
-      const priorMonthDate = new Date();
-      priorMonthDate.setMonth(priorMonthDate.getMonth() - 1);
-      priorMonthDate.setDate(18);
-      const priorMonthIso = priorMonthDate.toISOString();
-
-      INITIAL_REPORTS.forEach((rep, idx) => {
-        const createdAt = idx >= 5 ? priorMonthIso : rep.createdAt;
-        const updatedAt = idx >= 5 && rep.resolvedAt ? rep.resolvedAt : (idx >= 5 ? priorMonthIso : rep.updatedAt);
-        const resolvedAt = rep.resolvedAt || null;
-        const reportDate = toAsuncionDateKey(createdAt);
-        const reportMonth = toAsuncionMonthKey(createdAt);
-
-        insertReport.run(
-          rep.id,
-          rep.category,
-          rep.description,
-          rep.photoUrl,
-          rep.location.lat,
-          rep.location.lng,
-          rep.location.address,
-          rep.location.barrio,
-          null,
-          rep.citizenName,
-          rep.citizenPhone || null,
-          rep.severity,
-          rep.status,
-          rep.resolutionNotes || null,
-          createdAt,
-          reportDate,
-          reportMonth,
-          updatedAt,
-          resolvedAt
-        );
-
-        insertHistory.run(
-          `${rep.id}-h1`,
-          rep.id,
-          createdAt,
-          null,
-          'Pendiente',
-          rep.citizenName,
-          'Reporte registrado en plataforma ciudadana.'
-        );
-
-        if (rep.status !== 'Pendiente') {
-          insertHistory.run(
-            `${rep.id}-h2`,
-            rep.id,
-            updatedAt,
-            'Pendiente',
-            rep.status,
-            'Dirección de Obras Municipales',
-            rep.resolutionNotes || `Estado actualizado a ${rep.status}.`
-          );
-        }
-      });
-    });
-  }
-
-  function createSession(subjectType: 'citizen' | 'admin', subjectId: string): string {
+  // -------------------------------------------------------------------------
+  // Sesiones
+  // -------------------------------------------------------------------------
+  async function createSession(subjectType: 'citizen' | 'admin', subjectId: string): Promise<string> {
     const token = crypto.randomBytes(24).toString('hex');
     const now = new Date();
     const expires = new Date(now.getTime() + 14 * 24 * 3600 * 1000);
-    db.prepare(`
-      INSERT INTO sessions (token, subject_type, subject_id, created_at, expires_at)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(token, subjectType, subjectId, now.toISOString(), expires.toISOString());
+    await exec.query(
+      `INSERT INTO sessions (token, subject_type, subject_id, created_at, expires_at)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [token, subjectType, subjectId, now.toISOString(), expires.toISOString()]
+    );
     return token;
   }
 
-  function resolveSession(token: string | undefined, expectedType: 'citizen' | 'admin'): string | null {
+  async function resolveSession(token: string | undefined, expectedType: 'citizen' | 'admin'): Promise<string | null> {
     if (!token) return null;
-    const row = db
-      .prepare('SELECT subject_id, expires_at FROM sessions WHERE token = ? AND subject_type = ?')
-      .get(token, expectedType) as { subject_id: string; expires_at: string } | undefined;
+    const { rows } = await exec.query<{ subject_id: string; expires_at: Ts }>(
+      'SELECT subject_id, expires_at FROM sessions WHERE token = $1 AND subject_type = $2',
+      [token, expectedType]
+    );
+    const row = rows[0];
     if (!row) return null;
     if (new Date(row.expires_at).getTime() < Date.now()) {
-      db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
+      await exec.query('DELETE FROM sessions WHERE token = $1', [token]);
       return null;
     }
     return row.subject_id;
   }
 
-  function deleteSession(token: string | undefined) {
+  async function deleteSession(token: string | undefined): Promise<void> {
     if (!token) return;
-    db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
+    await exec.query('DELETE FROM sessions WHERE token = $1', [token]);
   }
 
-  function getHistoryMap(reportIds: string[]): Map<string, StatusHistoryEntry[]> {
+  // -------------------------------------------------------------------------
+  // Reportes
+  // -------------------------------------------------------------------------
+  async function getHistoryMap(q: Queryable, reportIds: string[]): Promise<Map<string, StatusHistoryEntry[]>> {
     const map = new Map<string, StatusHistoryEntry[]>();
     if (reportIds.length === 0) return map;
 
-    const placeholders = reportIds.map(() => '?').join(',');
-    const rows = db
-      .prepare(
-        `SELECT id, report_id, timestamp, previous_status, new_status, changed_by, notes
-         FROM report_status_history
-         WHERE report_id IN (${placeholders})
-         ORDER BY timestamp ASC`
-      )
-      .all(...reportIds) as unknown as HistoryRow[];
+    const { rows } = await q.query<HistoryRow>(
+      `SELECT id, report_id, "timestamp", previous_status, new_status, changed_by, notes
+       FROM report_status_history
+       WHERE report_id = ANY($1::text[])
+       ORDER BY "timestamp" ASC`,
+      [reportIds]
+    );
 
     for (const h of rows) {
       const list = map.get(h.report_id) || [];
       list.push({
         id: h.id,
-        timestamp: h.timestamp,
+        timestamp: iso(h.timestamp),
         previousStatus: h.previous_status || undefined,
         newStatus: h.new_status,
         changedBy: h.changed_by,
@@ -414,62 +484,45 @@ export function createAsuncionDb(dbPath: string) {
     return map;
   }
 
-  function listReports(filters?: ReportQueryFilters): IncidentReport[] {
+  async function listReports(filters?: ReportQueryFilters): Promise<IncidentReport[]> {
     const clauses: string[] = [];
-    const params: (string | number)[] = [];
+    const params: unknown[] = [];
+    const add = (value: unknown): string => {
+      params.push(value);
+      return `$${params.length}`;
+    };
 
-    if (filters?.date) {
-      clauses.push('report_date = ?');
-      params.push(filters.date.trim());
-    }
-    if (filters?.month) {
-      clauses.push('report_month = ?');
-      params.push(filters.month.trim());
-    }
-    if (filters?.status && filters.status !== 'Todos') {
-      clauses.push('status = ?');
-      params.push(filters.status);
-    }
-    if (filters?.category && filters.category !== 'Todas') {
-      clauses.push('category = ?');
-      params.push(filters.category);
-    }
-    if (filters?.barrio && filters.barrio !== 'Todos') {
-      clauses.push('barrio = ?');
-      params.push(filters.barrio);
-    }
+    if (filters?.date) clauses.push(`report_date = ${add(filters.date.trim())}`);
+    if (filters?.month) clauses.push(`report_month = ${add(filters.month.trim())}`);
+    if (filters?.status && filters.status !== 'Todos') clauses.push(`status = ${add(filters.status)}`);
+    if (filters?.category && filters.category !== 'Todas') clauses.push(`category = ${add(filters.category)}`);
+    if (filters?.barrio && filters.barrio !== 'Todos') clauses.push(`barrio = ${add(filters.barrio)}`);
     if (filters?.q && filters.q.trim() !== '') {
-      const like = `%${filters.q.trim().toLowerCase()}%`;
-      if (filters.searchCitizen) {
-        clauses.push(
-          '(LOWER(id) LIKE ? OR LOWER(citizen_name) LIKE ? OR LOWER(address) LIKE ? OR LOWER(barrio) LIKE ? OR LOWER(description) LIKE ?)'
-        );
-        params.push(like, like, like, like, like);
-      } else {
-        clauses.push(
-          '(LOWER(id) LIKE ? OR LOWER(address) LIKE ? OR LOWER(barrio) LIKE ? OR LOWER(description) LIKE ?)'
-        );
-        params.push(like, like, like, like);
-      }
+      const like = add(`%${filters.q.trim().toLowerCase()}%`);
+      const fields = ['LOWER(id)', 'LOWER(address)', 'LOWER(barrio)', 'LOWER(description)'];
+      if (filters.searchCitizen) fields.push('LOWER(citizen_name)');
+      clauses.push(`(${fields.map((f) => `${f} LIKE ${like}`).join(' OR ')})`);
     }
 
     const whereSql = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
-    const rows = db
-      .prepare(`SELECT * FROM reports ${whereSql} ORDER BY created_at DESC`)
-      .all(...params) as unknown as ReportRow[];
+    const { rows } = await exec.query<ReportRow>(
+      `SELECT * FROM reports ${whereSql} ORDER BY created_at DESC`,
+      params
+    );
 
-    const historyMap = getHistoryMap(rows.map((r) => r.id));
+    const historyMap = await getHistoryMap(exec, rows.map((r) => r.id));
     return rows.map((row) => mapReport(row, historyMap.get(row.id) || []));
   }
 
-  function getReportById(id: string): IncidentReport | null {
-    const row = db.prepare('SELECT * FROM reports WHERE id = ?').get(id) as unknown as ReportRow | undefined;
+  async function getReportById(id: string, q: Queryable = exec): Promise<IncidentReport | null> {
+    const { rows } = await q.query<ReportRow>('SELECT * FROM reports WHERE id = $1', [id]);
+    const row = rows[0];
     if (!row) return null;
-    const historyMap = getHistoryMap([row.id]);
+    const historyMap = await getHistoryMap(q, [row.id]);
     return mapReport(row, historyMap.get(row.id) || []);
   }
 
-  function createReport(input: {
+  async function createReport(input: {
     category: IncidentCategory;
     description: string;
     photoUrl: string;
@@ -479,147 +532,136 @@ export function createAsuncionDb(dbPath: string) {
     citizenPhone?: string;
     severity: IncidentSeverity;
     createdAt?: string;
-  }): IncidentReport {
-    return runInTransaction(() => {
+  }): Promise<IncidentReport> {
+    return withTransaction(async (tx) => {
       const createdAt = input.createdAt || new Date().toISOString();
       const reportDate = toAsuncionDateKey(createdAt);
       const reportMonth = toAsuncionMonthKey(createdAt);
       const year = reportDate.slice(0, 4) || String(new Date().getFullYear());
 
-      const existingYearRows = db
-        .prepare('SELECT id FROM reports WHERE id LIKE ?')
-        .all(`ASU-${year}-%`) as { id: string }[];
-      let maxSeq = 0;
-      for (const r of existingYearRows) {
-        const suffix = Number(r.id.split('-')[2]);
-        if (!Number.isNaN(suffix) && suffix > maxSeq) maxSeq = suffix;
-      }
-      const id = `ASU-${year}-${String(maxSeq + 1).padStart(3, '0')}`;
+      // Contador atómico por año: dos reportes simultáneos nunca reciben el mismo ID.
+      const counter = await tx.query<{ last_seq: number }>(
+        `INSERT INTO report_counters (year, last_seq) VALUES ($1, 1)
+         ON CONFLICT (year) DO UPDATE SET last_seq = report_counters.last_seq + 1
+         RETURNING last_seq`,
+        [year]
+      );
+      const id = `ASU-${year}-${String(counter.rows[0].last_seq).padStart(3, '0')}`;
 
       let resolvedCitizenId: string | null = null;
       if (input.citizenId) {
         const cleanCI = normalizeCI(input.citizenId);
         if (cleanCI) {
-          const citizenRow = db.prepare('SELECT id FROM citizens WHERE id = ?').get(cleanCI) as
-            | { id: string }
-            | undefined;
-          if (!citizenRow) {
-            db.prepare(
-              'INSERT INTO citizens (id, ci, full_name, phone, registered_at) VALUES (?, ?, ?, ?, ?)'
-            ).run(cleanCI, cleanCI, input.citizenName.trim(), input.citizenPhone?.trim() || null, createdAt);
-          }
+          await tx.query(
+            `INSERT INTO citizens (id, ci, full_name, phone, registered_at)
+             VALUES ($1, $1, $2, $3, $4)
+             ON CONFLICT (id) DO NOTHING`,
+            [cleanCI, input.citizenName.trim(), input.citizenPhone?.trim() || null, createdAt]
+          );
           resolvedCitizenId = cleanCI;
         }
       }
 
-      db.prepare(`
-        INSERT INTO reports (
-          id, category, description, photo_url, lat, lng, address, barrio,
-          citizen_id, citizen_name, citizen_phone, severity, status, resolution_notes,
-          created_at, report_date, report_month, updated_at, resolved_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pendiente', NULL, ?, ?, ?, ?, NULL)
-      `).run(
-        id,
-        input.category,
-        input.description.trim(),
-        input.photoUrl,
-        input.location.lat,
-        input.location.lng,
-        input.location.address.trim(),
-        input.location.barrio.trim(),
-        resolvedCitizenId,
-        input.citizenName.trim(),
-        input.citizenPhone?.trim() || null,
-        input.severity,
-        createdAt,
-        reportDate,
-        reportMonth,
-        createdAt
+      await tx.query(
+        `INSERT INTO reports (
+           id, category, description, photo_url, lat, lng, address, barrio,
+           citizen_id, citizen_name, citizen_phone, severity, status, resolution_notes,
+           created_at, report_date, report_month, updated_at, resolved_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'Pendiente', NULL, $13, $14, $15, $13, NULL)`,
+        [
+          id,
+          input.category,
+          input.description.trim(),
+          input.photoUrl,
+          input.location.lat,
+          input.location.lng,
+          input.location.address.trim(),
+          input.location.barrio.trim(),
+          resolvedCitizenId,
+          input.citizenName.trim(),
+          input.citizenPhone?.trim() || null,
+          input.severity,
+          createdAt,
+          reportDate,
+          reportMonth
+        ]
       );
 
-      db.prepare(`
-        INSERT INTO report_status_history (
-          id, report_id, timestamp, previous_status, new_status, changed_by, notes
-        ) VALUES (?, ?, ?, NULL, 'Pendiente', ?, ?)
-      `).run(
-        `${id}-h-${Date.now()}`,
-        id,
-        createdAt,
-        input.citizenName.trim(),
-        'Reporte registrado en plataforma ciudadana.'
+      await tx.query(
+        `INSERT INTO report_status_history (id, report_id, "timestamp", previous_status, new_status, changed_by, notes)
+         VALUES ($1, $2, $3, NULL, 'Pendiente', $4, $5)`,
+        [
+          `${id}-h-${Date.now()}`,
+          id,
+          createdAt,
+          input.citizenName.trim(),
+          'Reporte registrado en plataforma ciudadana.'
+        ]
       );
 
-      const created = getReportById(id);
+      const created = await getReportById(id, tx);
       if (!created) throw new Error('Failed to retrieve created report');
       return created;
     });
   }
 
-  function updateReportStatus(
+  async function updateReportStatus(
     id: string,
     newStatus: IncidentStatus,
     notes?: string,
     changedBy?: string
-  ): IncidentReport | null {
-    return runInTransaction(() => {
-      const existing = db.prepare('SELECT * FROM reports WHERE id = ?').get(id) as unknown as ReportRow | undefined;
+  ): Promise<IncidentReport | null> {
+    return withTransaction(async (tx) => {
+      const found = await tx.query<ReportRow>('SELECT * FROM reports WHERE id = $1 FOR UPDATE', [id]);
+      const existing = found.rows[0];
       if (!existing) return null;
 
       const now = new Date().toISOString();
       const nextNotes = notes !== undefined ? notes : existing.resolution_notes;
       const nextResolvedAt =
-        newStatus === 'Solucionado' ? existing.resolved_at || now : null;
+        newStatus === 'Solucionado' ? (existing.resolved_at ? iso(existing.resolved_at) : now) : null;
 
-      db.prepare(`
-        UPDATE reports
-        SET status = ?, updated_at = ?, resolution_notes = ?, resolved_at = ?
-        WHERE id = ?
-      `).run(newStatus, now, nextNotes, nextResolvedAt, id);
-
-      db.prepare(`
-        INSERT INTO report_status_history (
-          id, report_id, timestamp, previous_status, new_status, changed_by, notes
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        `${id}-h-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
-        id,
-        now,
-        existing.status,
-        newStatus,
-        changedBy || 'Dirección de Obras Municipales',
-        notes ?? null
+      await tx.query(
+        `UPDATE reports
+         SET status = $1, updated_at = $2, resolution_notes = $3, resolved_at = $4
+         WHERE id = $5`,
+        [newStatus, now, nextNotes, nextResolvedAt, id]
       );
 
-      return getReportById(id);
+      await tx.query(
+        `INSERT INTO report_status_history (id, report_id, "timestamp", previous_status, new_status, changed_by, notes)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [
+          `${id}-h-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
+          id,
+          now,
+          existing.status,
+          newStatus,
+          changedBy || 'Dirección de Obras Municipales',
+          notes ?? null
+        ]
+      );
+
+      return getReportById(id, tx);
     });
   }
 
-  function bulkUpdateReportsStatus(
+  async function bulkUpdateReportsStatus(
     ids: string[],
     newStatus: IncidentStatus,
     notes?: string,
     changedBy?: string
-  ): number {
-    if (!ids || ids.length === 0) return 0;
+  ): Promise<number> {
+    const uniqueIds = [...new Set((ids || []).filter((x): x is string => typeof x === 'string'))];
+    if (uniqueIds.length === 0) return 0;
 
-    return runInTransaction(() => {
+    return withTransaction(async (tx) => {
       const now = new Date().toISOString();
       let updatedCount = 0;
 
-      const selectStmt = db.prepare('SELECT * FROM reports WHERE id = ?');
-      const updateStmt = db.prepare(`
-        UPDATE reports
-        SET status = ?, updated_at = ?, resolution_notes = ?, resolved_at = ?
-        WHERE id = ?
-      `);
-      const historyStmt = db.prepare(`
-        INSERT INTO report_status_history (
-          id, report_id, timestamp, previous_status, new_status, changed_by, notes
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-      `);
-
-      for (const id of ids) {
-        const existing = selectStmt.get(id) as unknown as ReportRow | undefined;
+      for (const id of uniqueIds) {
+        const found = await tx.query<ReportRow>('SELECT * FROM reports WHERE id = $1 FOR UPDATE', [id]);
+        const existing = found.rows[0];
         if (!existing) continue;
         updatedCount++;
 
@@ -628,17 +670,26 @@ export function createAsuncionDb(dbPath: string) {
             ? notes.trim()
             : existing.resolution_notes || 'Solucionado en lote por cuadrilla vial municipal';
         const resolvedAt =
-          newStatus === 'Solucionado' ? existing.resolved_at || now : null;
+          newStatus === 'Solucionado' ? (existing.resolved_at ? iso(existing.resolved_at) : now) : null;
 
-        updateStmt.run(newStatus, now, finalNote, resolvedAt, id);
-        historyStmt.run(
-          `${id}-h-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
-          id,
-          now,
-          existing.status,
-          newStatus,
-          changedBy || 'Cuadrilla Vial Municipal (Lote)',
-          finalNote
+        await tx.query(
+          `UPDATE reports
+           SET status = $1, updated_at = $2, resolution_notes = $3, resolved_at = $4
+           WHERE id = $5`,
+          [newStatus, now, finalNote, resolvedAt, id]
+        );
+        await tx.query(
+          `INSERT INTO report_status_history (id, report_id, "timestamp", previous_status, new_status, changed_by, notes)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [
+            `${id}-h-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
+            id,
+            now,
+            existing.status,
+            newStatus,
+            changedBy || 'Cuadrilla Vial Municipal (Lote)',
+            finalNote
+          ]
         );
       }
 
@@ -646,16 +697,19 @@ export function createAsuncionDb(dbPath: string) {
     });
   }
 
-  function deleteReport(id: string): boolean {
-    const res = db.prepare('DELETE FROM reports WHERE id = ?').run(id);
-    return Number(res.changes) > 0;
+  async function deleteReport(id: string): Promise<boolean> {
+    const res = await exec.query('DELETE FROM reports WHERE id = $1', [id]);
+    return (res.rowCount ?? 0) > 0;
   }
 
-  function registerCitizen(input: {
+  // -------------------------------------------------------------------------
+  // Ciudadanos
+  // -------------------------------------------------------------------------
+  async function registerCitizen(input: {
     cedula: string;
     fullName: string;
     phone?: string;
-  }): { success: boolean; error?: string; citizen?: CitizenUser; token?: string } {
+  }): Promise<{ success: boolean; error?: string; citizen?: CitizenUser; token?: string }> {
     const validation = validateCitizenRegistration(input);
     if (!validation.valid || !validation.data) {
       return { success: false, error: validation.error || 'Datos inválidos.' };
@@ -664,92 +718,72 @@ export function createAsuncionDb(dbPath: string) {
     const { id, ci, fullName, phone } = validation.data;
     const now = new Date().toISOString();
 
-    db.prepare(`
-      INSERT INTO citizens (id, ci, full_name, phone, registered_at)
-      VALUES (?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET
-        full_name = excluded.full_name,
-        phone = excluded.phone
-    `).run(id, ci, fullName, phone || null, now);
+    const { rows } = await exec.query<CitizenRow>(
+      `INSERT INTO citizens (id, ci, full_name, phone, registered_at)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (id) DO UPDATE SET
+         full_name = EXCLUDED.full_name,
+         phone = EXCLUDED.phone
+       RETURNING *`,
+      [id, ci, fullName, phone || null, now]
+    );
 
-    const row = db.prepare('SELECT * FROM citizens WHERE id = ?').get(id) as unknown as CitizenRow;
-    const citizen = mapCitizen(row);
-    const token = createSession('citizen', citizen.id);
+    const citizen = mapCitizen(rows[0]);
+    const token = await createSession('citizen', citizen.id);
     return { success: true, citizen, token };
   }
 
-  function getCitizenBySession(token: string | undefined): CitizenUser | null {
-    const citizenId = resolveSession(token, 'citizen');
+  async function getCitizenBySession(token: string | undefined): Promise<CitizenUser | null> {
+    const citizenId = await resolveSession(token, 'citizen');
     if (!citizenId) return null;
-    const row = db.prepare('SELECT * FROM citizens WHERE id = ?').get(citizenId) as unknown as CitizenRow | undefined;
-    return row ? mapCitizen(row) : null;
+    const { rows } = await exec.query<CitizenRow>('SELECT * FROM citizens WHERE id = $1', [citizenId]);
+    return rows[0] ? mapCitizen(rows[0]) : null;
   }
 
-  function loginAdmin(
+  // -------------------------------------------------------------------------
+  // Administradores
+  // -------------------------------------------------------------------------
+  async function loginAdmin(
     identifier: string,
     password: string
-  ): { success: boolean; error?: string; admin?: AdminUser; token?: string } {
+  ): Promise<{ success: boolean; error?: string; admin?: AdminUser; token?: string }> {
     const raw = identifier.trim();
     const normalizedEmail = raw.toLowerCase();
-    const normalizedCI = normalizeCI(raw);
+    const normalizedCI = normalizeCI(raw) || '';
 
-    const accounts = db.prepare('SELECT * FROM admins').all() as unknown as AdminRow[];
-    const matched = accounts.find((acc) => {
-      if (normalizedCI && acc.ci === normalizedCI) return true;
-      if (acc.email && acc.email.toLowerCase() === normalizedEmail) return true;
-      if (normalizedEmail === 'admin' && acc.email === 'admin@asuncion.gov.py') return true;
-      return false;
-    });
+    const { rows } = await exec.query<AdminRow>(
+      `SELECT * FROM admins
+       WHERE ($1::text <> '' AND ci = $1::text)
+          OR (email IS NOT NULL AND LOWER(email) = $2::text)`,
+      [normalizedCI, normalizedEmail]
+    );
+    const matched = rows.find((acc) => normalizedCI && acc.ci === normalizedCI) || rows[0];
 
-    if (!matched || !verifyPassword(password, matched.password_hash)) {
+    if (!matched || !(await verifyPassword(password, matched.password_hash))) {
       return {
         success: false,
         error: 'Credenciales no autorizadas. Verifica tu C.I. / correo institucional y contraseña.'
       };
     }
 
-    const token = createSession('admin', matched.id);
-    const admin: AdminUser = {
-      id: matched.id,
-      ci: matched.ci,
-      employeeNumber: matched.employee_number,
-      email: matched.email || `ci.${matched.ci}@asuncion.gov.py`,
-      fullName: matched.full_name,
-      level: matched.level === 2 ? 2 : 1,
-      role: matched.role,
-      token,
-      createdAt: matched.created_at
-    };
-
-    return { success: true, admin, token };
+    const token = await createSession('admin', matched.id);
+    return { success: true, admin: mapAdminUser(matched, token), token };
   }
 
-  function getAdminBySession(token: string | undefined): AdminUser | null {
-    const adminId = resolveSession(token, 'admin');
+  async function getAdminBySession(token: string | undefined): Promise<AdminUser | null> {
+    const adminId = await resolveSession(token, 'admin');
     if (!adminId) return null;
-    const row = db.prepare('SELECT * FROM admins WHERE id = ?').get(adminId) as unknown as AdminRow | undefined;
-    if (!row) return null;
-    return {
-      id: row.id,
-      ci: row.ci,
-      employeeNumber: row.employee_number,
-      email: row.email || `ci.${row.ci}@asuncion.gov.py`,
-      fullName: row.full_name,
-      level: row.level === 2 ? 2 : 1,
-      role: row.role,
-      token: token!,
-      createdAt: row.created_at
-    };
+    const { rows } = await exec.query<AdminRow>('SELECT * FROM admins WHERE id = $1', [adminId]);
+    if (!rows[0]) return null;
+    return mapAdminUser(rows[0], token!);
   }
 
-  function listAdminAccounts(): AdminAccountPublic[] {
-    const rows = db
-      .prepare('SELECT * FROM admins ORDER BY created_at DESC')
-      .all() as unknown as AdminRow[];
+  async function listAdminAccounts(): Promise<AdminAccountPublic[]> {
+    const { rows } = await exec.query<AdminRow>('SELECT * FROM admins ORDER BY created_at DESC');
     return rows.map(mapAdminPublic);
   }
 
-  function createAdminAccount(
+  async function createAdminAccount(
     input: {
       ci: string;
       employeeNumber: string;
@@ -759,7 +793,7 @@ export function createAsuncionDb(dbPath: string) {
       email?: string;
     },
     actorAdmin: AdminUser | null
-  ): { success: boolean; error?: string; account?: AdminAccountPublic } {
+  ): Promise<{ success: boolean; error?: string; account?: AdminAccountPublic }> {
     if (!actorAdmin || actorAdmin.level !== 2) {
       return {
         success: false,
@@ -774,18 +808,15 @@ export function createAsuncionDb(dbPath: string) {
 
     const { id, ci, employeeNumber, fullName, level, password, email } = validation.data;
 
-    const existingCI = db.prepare('SELECT id FROM admins WHERE id = ? OR ci = ?').get(id, ci);
-    if (existingCI) {
-      return {
-        success: false,
-        error: `Ya existe un perfil administrativo registrado con el C.I. ${ci}.`
-      };
+    const existingCI = await exec.query('SELECT id FROM admins WHERE id = $1 OR ci = $2', [id, ci]);
+    if (existingCI.rows.length > 0) {
+      return { success: false, error: `Ya existe un perfil administrativo registrado con el C.I. ${ci}.` };
     }
 
-    const existingEmp = db
-      .prepare('SELECT id FROM admins WHERE LOWER(employee_number) = LOWER(?)')
-      .get(employeeNumber);
-    if (existingEmp) {
+    const existingEmp = await exec.query('SELECT id FROM admins WHERE LOWER(employee_number) = LOWER($1)', [
+      employeeNumber
+    ]);
+    if (existingEmp.rows.length > 0) {
       return {
         success: false,
         error: `El Número de Empleado "${employeeNumber}" ya está asignado a otro perfil.`
@@ -793,14 +824,9 @@ export function createAsuncionDb(dbPath: string) {
     }
 
     if (email) {
-      const existingEmail = db
-        .prepare('SELECT id FROM admins WHERE LOWER(email) = LOWER(?)')
-        .get(email);
-      if (existingEmail) {
-        return {
-          success: false,
-          error: `El correo "${email}" ya se encuentra registrado.`
-        };
+      const existingEmail = await exec.query('SELECT id FROM admins WHERE LOWER(email) = LOWER($1)', [email]);
+      if (existingEmail.rows.length > 0) {
+        return { success: false, error: `El correo "${email}" ya se encuentra registrado.` };
       }
     }
 
@@ -808,65 +834,68 @@ export function createAsuncionDb(dbPath: string) {
     const role: AdminAccountPublic['role'] = level === 2 ? 'administrador' : 'analista';
     const createdBy = `${actorAdmin.fullName} (C.I. ${actorAdmin.ci})`;
 
-    db.prepare(`
-      INSERT INTO admins (id, ci, employee_number, full_name, email, level, role, password_hash, created_at, created_by)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      id,
-      ci,
-      employeeNumber,
-      fullName,
-      email || null,
-      level,
-      role,
-      hashPassword(password),
-      createdAt,
-      createdBy
-    );
-
-    const row = db.prepare('SELECT * FROM admins WHERE id = ?').get(id) as unknown as AdminRow;
-    return { success: true, account: mapAdminPublic(row) };
+    try {
+      const { rows } = await exec.query<AdminRow>(
+        `INSERT INTO admins (id, ci, employee_number, full_name, email, level, role, password_hash, created_at, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         RETURNING *`,
+        [id, ci, employeeNumber, fullName, email || null, level, role, await hashPassword(password), createdAt, createdBy]
+      );
+      return { success: true, account: mapAdminPublic(rows[0]) };
+    } catch (err) {
+      // 23505 = dato duplicado (dos personas creando el mismo perfil a la vez)
+      if ((err as { code?: string }).code === '23505') {
+        return { success: false, error: 'Ya existe un perfil con esos datos (C.I., número de empleado o correo).' };
+      }
+      throw err;
+    }
   }
 
-  function deleteAdminAccount(
+  async function deleteAdminAccount(
     targetId: string,
     actorAdmin: AdminUser | null
-  ): { success: boolean; error?: string } {
+  ): Promise<{ success: boolean; error?: string }> {
     if (!actorAdmin || actorAdmin.level !== 2) {
-      return {
-        success: false,
-        error: 'Solo perfiles Nivel 2 pueden eliminar cuentas administrativas.'
-      };
+      return { success: false, error: 'Solo perfiles Nivel 2 pueden eliminar cuentas administrativas.' };
     }
     if (actorAdmin.id === targetId) {
-      return {
-        success: false,
-        error: 'No puedes eliminar tu propio perfil mientras estás conectado.'
-      };
-    }
-    if (targetId === '1000001') {
-      return {
-        success: false,
-        error: 'No se puede eliminar la cuenta administrativa principal del sistema.'
-      };
+      return { success: false, error: 'No puedes eliminar tu propio perfil mientras estás conectado.' };
     }
 
-    runInTransaction(() => {
-      db.prepare("DELETE FROM sessions WHERE subject_type = 'admin' AND subject_id = ?").run(targetId);
-      db.prepare('DELETE FROM admins WHERE id = ?').run(targetId);
+    const { rows } = await exec.query<{ created_by: string | null }>(
+      'SELECT created_by FROM admins WHERE id = $1',
+      [targetId]
+    );
+    if (rows.length === 0) {
+      return { success: false, error: 'La cuenta administrativa no existe.' };
+    }
+    // La cuenta principal (creada desde ADMIN_CI en el .env) es la única sin "created_by".
+    if (rows[0].created_by === null) {
+      return { success: false, error: 'No se puede eliminar la cuenta administrativa principal del sistema.' };
+    }
+
+    await withTransaction(async (tx) => {
+      await tx.query("DELETE FROM sessions WHERE subject_type = 'admin' AND subject_id = $1", [targetId]);
+      await tx.query('DELETE FROM admins WHERE id = $1', [targetId]);
     });
 
     return { success: true };
   }
 
-  function close() {
-    db.close();
+  async function ping(): Promise<void> {
+    await exec.query('SELECT 1');
+  }
+
+  async function close(opts: { dropSchema?: boolean } = {}): Promise<void> {
+    if (opts.dropSchema && schema) {
+      await pool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    }
+    await pool.end();
   }
 
   return {
-    dbPath,
     listReports,
-    getReportById,
+    getReportById: (id: string) => getReportById(id),
     createReport,
     updateReportStatus,
     bulkUpdateReportsStatus,
@@ -879,6 +908,7 @@ export function createAsuncionDb(dbPath: string) {
     createAdminAccount,
     deleteAdminAccount,
     deleteSession,
+    ping,
     close
   };
 }
