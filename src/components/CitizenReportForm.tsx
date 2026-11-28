@@ -540,7 +540,6 @@ export const CitizenReportForm: React.FC<Props> = ({ onReportCreated, onOpenIden
                         <input
                           type="file"
                           accept="image/*"
-                          capture="environment"
                           onChange={handleFileChange}
                           className="hidden"
                         />
@@ -561,7 +560,6 @@ export const CitizenReportForm: React.FC<Props> = ({ onReportCreated, onOpenIden
                     <input
                       type="file"
                       accept="image/*"
-                      capture="environment"
                       onChange={handleFileChange}
                       className="hidden"
                     />
