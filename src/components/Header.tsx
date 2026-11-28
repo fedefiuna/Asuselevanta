@@ -59,9 +59,6 @@ export const Header: React.FC<Props> = ({
             onClick={() => setActiveView('report')}
             className="flex items-center gap-1.5 sm:gap-2.5 cursor-pointer group shrink-0"
           >
-            <div className="w-8 h-8 sm:w-10 sm:h-10 rounded-xl sm:rounded-2xl bg-linear-to-tr from-emerald-600 to-teal-500 flex items-center justify-center shadow-lg shadow-emerald-500/20 group-hover:scale-105 transition shrink-0">
-              <img src="/icon.svg" alt="Asunción" className="w-4 h-4 sm:w-6 sm:h-6 invert dark:invert-0" />
-            </div>
             <div className="min-w-0">
               <div className="flex items-center gap-1.5 whitespace-nowrap">
                 <span className="font-black text-zinc-900 dark:text-zinc-50 text-xs sm:text-base tracking-tight">
