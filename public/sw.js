@@ -1,5 +1,5 @@
 // Service Worker for Asunción Se Levanta PWA
-const CACHE_NAME = 'asuncion-v2'; // v2: descarta cachés antiguos que pudieran contener respuestas de /api
+const CACHE_NAME = 'asuncion-v3'; // v2: descarta cachés antiguos que pudieran contener respuestas de /api
 const STATIC_ASSETS = [
   '/',
   '/index.html',
