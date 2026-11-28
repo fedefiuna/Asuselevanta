@@ -59,6 +59,7 @@ export const Header: React.FC<Props> = ({
             onClick={() => setActiveView('report')}
             className="flex items-center gap-1.5 sm:gap-2.5 cursor-pointer group shrink-0"
           >
+            <img src="/icon.png" alt="Asunción" className="w-8 h-8 sm:w-10 sm:h-10 object-contain shrink-0" />
             <div className="min-w-0">
               <div className="flex items-center gap-1.5 whitespace-nowrap">
                 <span className="font-black text-zinc-900 dark:text-zinc-50 text-xs sm:text-base tracking-tight">
